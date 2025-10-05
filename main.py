@@ -10,7 +10,7 @@ from datetime import timedelta
 from functions_framework import http
 from google.cloud import storage
 
-# 优先：文本字幕 API
+# 优先方案：文本字幕 API
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -18,7 +18,7 @@ from youtube_transcript_api import (
     VideoUnavailable,
 )
 
-# 备用：仅下载字幕文件
+# 备用：只下载字幕文件
 import yt_dlp
 from yt_dlp.utils import DownloadError
 from yt_dlp.networking.exceptions import HTTPError as YTDLPHTTPError
@@ -26,12 +26,13 @@ from yt_dlp.networking.exceptions import HTTPError as YTDLPHTTPError
 logging.basicConfig(level=logging.INFO)
 
 # ===== 环境变量 =====
-BUCKET = os.environ.get("VIDEO_BUCKET")                           # 目标 GCS 桶（必填）
+BUCKET = os.environ.get("VIDEO_BUCKET")                      # 可选：有就上传备份；没有也能返回正文
 DEFAULT_FORMAT = (os.environ.get("DEFAULT_FORMAT") or "vtt").lower()
-SERVICE_ACCOUNT_EMAIL = os.environ.get("SERVICE_ACCOUNT_EMAIL")   # 用于无私钥签名（必填）
+ENABLE_SIGNED_URL = os.environ.get("ENABLE_SIGNED_URL", "false").lower() == "true"
+SERVICE_ACCOUNT_EMAIL = os.environ.get("SERVICE_ACCOUNT_EMAIL")  # 仅当 ENABLE_SIGNED_URL=true 时需要
 YT_COOKIES_PATH = os.environ.get("YT_COOKIES_PATH", "/var/secrets/cookies.txt")
 
-OUT_DIR = "/tmp"  # Cloud Run/Functions 允许写 /tmp
+OUT_DIR = "/tmp"
 
 _YT_ID_RE = re.compile(r"(?:youtu\.be/|v=)([A-Za-z0-9_-]{11})")
 
@@ -69,64 +70,65 @@ def _to_vtt(snippets) -> str:
         out.append("")
     return "\n".join(out)
 
-def _write_file(path: str, content: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+def _upload_to_gcs(local_path: str, bucket: str, content_type: str) -> str | None:
+    if not bucket:
+        return None
+    try:
+        client = storage.Client()
+        bkt = client.bucket(bucket)
+        blob_name = f"subs/{os.path.basename(local_path)}"
+        blob = bkt.blob(blob_name)
+        blob.upload_from_filename(local_path, content_type=content_type)
+        return f"gs://{bucket}/{blob_name}"
+    except Exception as e:
+        logging.warning(f"[GCS] upload failed: {e}")
+        return None
 
-def _upload_and_sign(local_path: str, bucket: str, ttl: int, content_type: str) -> str:
+def _maybe_signed_url(gs_uri: str, ttl: int) -> str | None:
     """
-    用 IAM Credentials 显式签名：
-      1) 上传对象
-      2) 用 iam.Signer 生成“可签名的 Credentials”
-      3) 传给 blob.generate_signed_url(credentials=...) 走无私钥签名
-    需要：
-      - 环境变量 SERVICE_ACCOUNT_EMAIL 设置为绑定到 Cloud Run 的服务账号邮箱
-      - 该服务账号具备 roles/iam.serviceAccountTokenCreator + 存储桶对象读写权限
+    可选：尝试生成签名 URL；失败则返回 None，不抛错。
+    需要 ENABLE_SIGNED_URL=true 且 SERVICE_ACCOUNT_EMAIL 已设置并有权限。
     """
-    from google.auth.transport.requests import Request
-    from google.auth import compute_engine
-    from google.auth.iam import Signer
-    from google.auth.credentials import with_signer
+    if not (ENABLE_SIGNED_URL and SERVICE_ACCOUNT_EMAIL and gs_uri.startswith("gs://")):
+        return None
+    try:
+        _, path = gs_uri.split("gs://", 1)
+        bucket, blob_name = path.split("/", 1)
+        client = storage.Client()
+        blob = client.bucket(bucket).blob(blob_name)
 
-    if not SERVICE_ACCOUNT_EMAIL:
-        raise RuntimeError("Missing SERVICE_ACCOUNT_EMAIL env for signing")
+        # 使用“显式 credentials”方式尝试走 IAM（不同库版本更稳）
+        from google.auth.transport.requests import Request
+        from google.auth import compute_engine
+        from google.auth.iam import Signer
 
-    # 1) 上传对象
-    client = storage.Client()
-    bkt = client.bucket(bucket)
-    blob_name = f"subs/{os.path.basename(local_path)}"
-    blob = bkt.blob(blob_name)
-    blob.upload_from_filename(local_path, content_type=content_type)
+        source_credentials = compute_engine.Credentials()
+        request = Request()
+        signer = Signer(request, source_credentials, SERVICE_ACCOUNT_EMAIL)
 
-    # 2) 构造“会用 IAM 来 signBlob 的可签名凭据”
-    #    注意：source_credentials 用的是当前运行环境（Compute Engine token），不含私钥；
-    #    但 with_signer.Credentials + iam.Signer 会把签名工作委托给 IAM Credentials API。
-    source_credentials = compute_engine.Credentials()        # 当前环境 token
-    request = Request()
-    signer = Signer(request, source_credentials, SERVICE_ACCOUNT_EMAIL)
-    signed_credentials = with_signer.Credentials(
-        signer=signer,
-        service_account_email=SERVICE_ACCOUNT_EMAIL,
-        token_uri=source_credentials.token_uri,
-    )
+        class _SignCred:
+            # 最小实现：提供 signer 与 signer_email
+            def __init__(self, signer, email):
+                self.signer = signer
+                self.signer_email = email
 
-    # 3) 生成 V4 签名 URL（显式传入 credentials，确保走 IAM 路径）
-    url = blob.generate_signed_url(
-        expiration=timedelta(seconds=ttl),
-        version="v4",
-        credentials=signed_credentials,          # <<< 关键：显式传入签名凭据
-    )
-    return url
+        signed_credentials = _SignCred(signer, SERVICE_ACCOUNT_EMAIL)
+
+        url = blob.generate_signed_url(
+            expiration=timedelta(seconds=ttl),
+            version="v4",
+            credentials=signed_credentials,
+        )
+        return url
+    except Exception as e:
+        logging.warning(f"[GCS] signed URL failed: {e}")
+        return None
 
 # ===== 方案 A：youtube-transcript-api（优先）=====
 def _fetch_with_transcript_api_list(video_id: str, target_langs, fmt: str, translate_missing: bool):
-    """
-    使用 list_transcripts（较新版本提供），全量拿语言并可翻译缺失语言。
-    """
     tlist = YouTubeTranscriptApi.list_transcripts(video_id)
     langs_meta = sorted({t.language_code for t in tlist})
     want_langs = target_langs or list(langs_meta)
-
     results = []
     for lang in want_langs:
         transcript = None
@@ -144,28 +146,21 @@ def _fetch_with_transcript_api_list(video_id: str, target_langs, fmt: str, trans
         if not transcript:
             logging.info(f"[TranscriptAPI:list] No transcript for {lang}")
             continue
-
         data = transcript.fetch()
         raw = [dict(text=x["text"], start=float(x["start"]), duration=float(x.get("duration", 0.0))) for x in data]
-
         ext = "srt" if fmt == "srt" else "vtt"
         fname = f"{video_id}.{lang}.{ext}"
         fpath = f"{OUT_DIR}/{fname}"
         text = _to_srt(raw) if ext == "srt" else _to_vtt(raw)
-        _write_file(fpath, text)
-        results.append({"lang": lang, "path": fpath})
-
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(text)
+        results.append({"lang": lang, "path": fpath, "text": text})
     return {"ok": True, "files": results, "languages_meta": sorted(langs_meta)}
 
 def _fetch_with_transcript_api_get(video_id: str, target_langs, fmt: str, translate_missing: bool):
-    """
-    兼容老版本库：没有 list_transcripts 时，针对用户指定语言逐一 get_transcript。
-    若用户没传 langs，我们尝试若干常见语言；拿不到则返回空，进入 yt-dlp 降级。
-    """
     probe_langs = target_langs or ["en", "en-US", "en-GB", "zh-Hans", "zh-Hant", "ja", "es"]
     results = []
     meta = set()
-
     for lang in probe_langs:
         try:
             data = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
@@ -174,35 +169,30 @@ def _fetch_with_transcript_api_get(video_id: str, target_langs, fmt: str, transl
         except Exception as e:
             logging.warning(f"[TranscriptAPI:get] {lang} -> {e}")
             continue
-
         raw = [dict(text=x["text"], start=float(x["start"]), duration=float(x.get("duration", 0.0))) for x in data]
         ext = "srt" if fmt == "srt" else "vtt"
         fname = f"{video_id}.{lang}.{ext}"
         fpath = f"{OUT_DIR}/{fname}"
         text = _to_srt(raw) if ext == "srt" else _to_vtt(raw)
-        _write_file(fpath, text)
-        results.append({"lang": lang, "path": fpath})
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(text)
+        results.append({"lang": lang, "path": fpath, "text": text})
         meta.add(lang)
-
     return {"ok": True, "files": results, "languages_meta": sorted(meta)}
 
 def fetch_with_transcript_api(video_id: str, target_langs, fmt: str, translate_missing: bool):
-    """
-    统一入口：若库有 list_transcripts 用它；没有则退化到 get_transcript。
-    """
     if hasattr(YouTubeTranscriptApi, "list_transcripts"):
         return _fetch_with_transcript_api_list(video_id, target_langs, fmt, translate_missing)
     else:
         return _fetch_with_transcript_api_get(video_id, target_langs, fmt, translate_missing)
 
-# ===== 方案 B：yt-dlp（降级，抗 429 强化）=====
+# ===== 方案 B：yt-dlp（降级，抗 429）=====
 _ANDROID_UA = "com.google.android.youtube/19.15.38 (Linux; U; Android 13) gzip"
 
 def _yt_dlp_opts_base(ext: str, accept_lang_header: str | None, cookiefile: str | None):
     headers = {"User-Agent": _ANDROID_UA}
     if accept_lang_header:
         headers["Accept-Language"] = accept_lang_header
-
     opts = {
         "skip_download": True,
         "writesubtitles": True,
@@ -210,13 +200,11 @@ def _yt_dlp_opts_base(ext: str, accept_lang_header: str | None, cookiefile: str 
         "subtitlesformat": ext,
         "outtmpl": f"{OUT_DIR}/%(title).80s-%(id)s.%(ext)s",
         "quiet": True,
-
-        # —— 抗 429：退避 + 降速 + Android 客户端画像 ——
         "retries": 10,
         "retry_sleep": "exponential",
         "sleep_interval_requests": 2.0,
         "max_sleep_interval_requests": 6.0,
-        "throttledratelimit": 1024 * 256,   # 256 KiB/s
+        "throttledratelimit": 1024 * 256,
         "http_headers": headers,
         "socket_timeout": 30,
         "extractor_args": {"youtube": {"player_client": ["android"]}},
@@ -235,11 +223,9 @@ _YT_CLIENT_PROFILES = [
 
 def fetch_with_ytdlp_smart(url_or_id: str, target_langs, fmt: str):
     ext = "srt" if fmt == "srt" else "vtt"
-
     accept_lang = None
     if target_langs and isinstance(target_langs, list) and len(target_langs) > 0:
         accept_lang = ",".join([f"{l};q=1.0" for l in target_langs[:3]])
-
     base_opts = _yt_dlp_opts_base(ext, accept_lang, YT_COOKIES_PATH)
     if target_langs and len(target_langs) > 0:
         base_opts["subtitleslangs"] = target_langs
@@ -253,9 +239,7 @@ def fetch_with_ytdlp_smart(url_or_id: str, target_langs, fmt: str):
         for k, v in profile.get("extractor_args", {}).items():
             ea[k] = v
         opts["extractor_args"] = ea
-
-        time.sleep(random.uniform(0.5, 1.5))  # 轻微抖动
-
+        time.sleep(random.uniform(0.5, 1.5))
         logging.info(f"[yt-dlp] Try profile #{idx}: {opts['extractor_args']}")
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -267,7 +251,9 @@ def fetch_with_ytdlp_smart(url_or_id: str, target_langs, fmt: str):
                 base = os.path.basename(p)
                 parts = base.split(".")
                 lang = parts[-2] if len(parts) >= 3 else "unknown"
-                files.append({"lang": lang, "path": p})
+                with open(p, "r", encoding="utf-8") as f:
+                    text = f.read()
+                files.append({"lang": lang, "path": p, "text": text})
             if files:
                 return {"ok": True, "files": files}
             last_err = RuntimeError("no subtitle files written")
@@ -284,7 +270,6 @@ def fetch_with_ytdlp_smart(url_or_id: str, target_langs, fmt: str):
             last_err = e
             logging.exception(f"[yt-dlp] unexpected: {e}")
             time.sleep(random.uniform(1.0, 3.0))
-
     if last_err:
         raise last_err
     raise RuntimeError("yt-dlp fallback failed without specific error")
@@ -294,11 +279,6 @@ def fetch_with_ytdlp_smart(url_or_id: str, target_langs, fmt: str):
 def fetch_subtitles(request):
     if request.method != "POST":
         return ("Use POST with JSON body.", 405)
-
-    if not BUCKET:
-        return ("Missing env VIDEO_BUCKET", 500)
-    if not SERVICE_ACCOUNT_EMAIL:
-        return ("Missing env SERVICE_ACCOUNT_EMAIL", 500)
 
     body = request.get_json(silent=True) or {}
     url = body.get("url") or body.get("id")
@@ -316,7 +296,7 @@ def fetch_subtitles(request):
     files = []
     meta_langs = []
 
-    # 方案 A：Transcript API（优先）
+    # 方案 A
     try:
         r = fetch_with_transcript_api(video_id, langs, fmt, translate_missing)
         files = r["files"]
@@ -324,13 +304,10 @@ def fetch_subtitles(request):
         logging.info(f"[TranscriptAPI] got files={len(files)} langs_meta={meta_langs}")
     except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
         logging.warning(f"[TranscriptAPI] known: {e}")
-    except AttributeError as e:
-        # 极端情况下库太旧，直接走 get_transcript 分支（函数内部已兼容）
-        logging.warning(f"[TranscriptAPI] attr error: {e}")
     except Exception as e:
         logging.exception(f"[TranscriptAPI] unexpected: {e}")
 
-    # 方案 B：yt-dlp 降级
+    # 方案 B
     if not files:
         try:
             y = fetch_with_ytdlp_smart(url, langs, fmt)
@@ -343,23 +320,37 @@ def fetch_subtitles(request):
 
     if not files:
         return (json.dumps({
-            "ok": False,
-            "video_id": video_id,
+            "ok": False, "video_id": video_id,
             "error": "No subtitles found by either transcript API or yt-dlp."
         }, ensure_ascii=False), 404, {"Content-Type": "application/json"})
 
+    # 上传（可选）+ 返回正文（一定有）
     content_type = "text/vtt" if fmt == "vtt" else "text/plain"
     out = []
     for f in files:
+        gs_uri = None
         try:
-            signed = _upload_and_sign(f["path"], BUCKET, ttl, content_type=content_type)
-        finally:
-            try:
-                os.remove(f["path"])
-            except Exception:
-                pass
-        out.append({"lang": f["lang"], "signed_url": signed})
+            gs_uri = _upload_to_gcs(f["path"], BUCKET, content_type=content_type) if BUCKET else None
+        except Exception as e:
+            logging.warning(f"[GCS] upload err: {e}")
+        signed_url = _maybe_signed_url(gs_uri, ttl) if gs_uri else None
+        out.append({
+            "lang": f["lang"],
+            "filename": os.path.basename(f["path"]),
+            "gcs_uri": gs_uri,
+            "signed_url": signed_url,
+            "content": f["text"],       # ← 直接把字幕文本返回，保证调用方一定可用
+        })
+        try:
+            os.remove(f["path"])
+        except Exception:
+            pass
 
-    payload = {"ok": True, "video_id": video_id, "format": fmt, "files": out,
-               "languages_detected": meta_langs}
+    payload = {
+        "ok": True,
+        "video_id": video_id,
+        "format": fmt,
+        "files": out,
+        "languages_detected": meta_langs
+    }
     return (json.dumps(payload, ensure_ascii=False), 200, {"Content-Type": "application/json"})
