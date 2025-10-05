@@ -1,4 +1,6 @@
-youtube-transcript-api>=1.2.2
+# 这个版本一定有 list_transcripts；同时我们也在代码里做了无该方法时的降级兼容
+youtube-transcript-api==0.6.0
+
 yt-dlp>=2024.10.0
-google-cloud-storage>=2.18.0
+google-cloud-storage>=2.18.1
 functions-framework==3.*
