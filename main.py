@@ -75,22 +75,46 @@ def _write_file(path: str, content: str):
 
 def _upload_and_sign(local_path: str, bucket: str, ttl: int, content_type: str) -> str:
     """
-    关键修复：传入 SERVICE_ACCOUNT_EMAIL，让 google-cloud-storage 走 IAM Credentials API 进行“无私钥签名”。
-    前提：该 SA 具备 roles/iam.serviceAccountTokenCreator，且有对象读/写权限。
+    用 IAM Credentials 显式签名：
+      1) 上传对象
+      2) 用 iam.Signer 生成“可签名的 Credentials”
+      3) 传给 blob.generate_signed_url(credentials=...) 走无私钥签名
+    需要：
+      - 环境变量 SERVICE_ACCOUNT_EMAIL 设置为绑定到 Cloud Run 的服务账号邮箱
+      - 该服务账号具备 roles/iam.serviceAccountTokenCreator + 存储桶对象读写权限
     """
+    from google.auth.transport.requests import Request
+    from google.auth import compute_engine
+    from google.auth.iam import Signer
+    from google.auth.credentials import with_signer
+
     if not SERVICE_ACCOUNT_EMAIL:
         raise RuntimeError("Missing SERVICE_ACCOUNT_EMAIL env for signing")
 
+    # 1) 上传对象
     client = storage.Client()
     bkt = client.bucket(bucket)
     blob_name = f"subs/{os.path.basename(local_path)}"
     blob = bkt.blob(blob_name)
     blob.upload_from_filename(local_path, content_type=content_type)
 
+    # 2) 构造“会用 IAM 来 signBlob 的可签名凭据”
+    #    注意：source_credentials 用的是当前运行环境（Compute Engine token），不含私钥；
+    #    但 with_signer.Credentials + iam.Signer 会把签名工作委托给 IAM Credentials API。
+    source_credentials = compute_engine.Credentials()        # 当前环境 token
+    request = Request()
+    signer = Signer(request, source_credentials, SERVICE_ACCOUNT_EMAIL)
+    signed_credentials = with_signer.Credentials(
+        signer=signer,
+        service_account_email=SERVICE_ACCOUNT_EMAIL,
+        token_uri=source_credentials.token_uri,
+    )
+
+    # 3) 生成 V4 签名 URL（显式传入 credentials，确保走 IAM 路径）
     url = blob.generate_signed_url(
         expiration=timedelta(seconds=ttl),
         version="v4",
-        service_account_email=SERVICE_ACCOUNT_EMAIL,  # <<< 关键
+        credentials=signed_credentials,          # <<< 关键：显式传入签名凭据
     )
     return url
 
