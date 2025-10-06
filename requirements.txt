@@ -1,4 +1,4 @@
+functions-framework==3.*
+google-cloud-storage>=2.18.1
 youtube-transcript-api==0.6.0
 yt-dlp>=2024.10.0
-google-cloud-storage>=2.18.1
-functions-framework==3.*
