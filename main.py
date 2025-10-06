@@ -26,11 +26,52 @@ from yt_dlp.networking.exceptions import HTTPError as YTDLPHTTPError
 logging.basicConfig(level=logging.INFO)
 
 # ===== 环境变量 =====
-BUCKET = os.environ.get("VIDEO_BUCKET")                      # 可选：有就上传备份；没有也能返回正文
+BUCKET = os.environ.get("VIDEO_BUCKET")
 DEFAULT_FORMAT = (os.environ.get("DEFAULT_FORMAT") or "vtt").lower()
 ENABLE_SIGNED_URL = os.environ.get("ENABLE_SIGNED_URL", "false").lower() == "true"
-SERVICE_ACCOUNT_EMAIL = os.environ.get("SERVICE_ACCOUNT_EMAIL")  # 仅当 ENABLE_SIGNED_URL=true 时需要
-YT_COOKIES_PATH = os.environ.get("YT_COOKIES_PATH", "/var/secrets/cookies.txt")
+SERVICE_ACCOUNT_EMAIL = os.environ.get("SERVICE_ACCOUNT_EMAIL")
+YT_COOKIES_PATH = os.environ.get("YT_COOKIES_PATH", "/tmp/cookies.txt")  # 改默认到 /tmp
+YT_COOKIES_TEXT = os.environ.get("YT_COOKIES_TEXT")  # ← 新增：Secret 以 env 注入
+
+def _write_cookiefile_from_header(cookie_header: str, out_path: str):
+    import time
+    expires = 2147483647
+    lines = ["# Netscape HTTP Cookie File"]
+    parts = [p.strip() for p in cookie_header.split(";") if p.strip()]
+    kvs = []
+    for p in parts:
+        if "=" in p:
+            name, val = p.split("=", 1)
+            kvs.append((name.strip(), val.strip()))
+    for domain in [".youtube.com", ".www.youtube.com"]:
+        for name, val in kvs:
+            lines.append("\t".join([domain, "TRUE", "/", "TRUE", str(expires), name, val]))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+def _hydrate_cookies_from_env():
+    """
+    若存在 YT_COOKIES_TEXT（通过 --set-secrets 注入），在冷启动时把它写到 YT_COOKIES_PATH。
+    兼容两种格式：
+      1) Netscape cookies.txt（以 '# Netscape HTTP Cookie File' 开头）
+      2) 'NAME=VALUE; NAME2=VALUE2; ...' 的 Header 串
+    """
+    try:
+        if not YT_COOKIES_TEXT:
+            return
+        os.makedirs(os.path.dirname(YT_COOKIES_PATH), exist_ok=True)
+        text = YT_COOKIES_TEXT.strip()
+        if text.startswith("# Netscape HTTP Cookie File"):
+            with open(YT_COOKIES_PATH, "w", encoding="utf-8") as f:
+                f.write(text if text.endswith("\n") else text + "\n")
+        else:
+            _write_cookiefile_from_header(text, YT_COOKIES_PATH)
+        logging.info(f"[cookies] hydrated to {YT_COOKIES_PATH}")
+    except Exception as e:
+        logging.warning(f"[cookies] hydrate failed: {e}")
+
+# 冷启动即执行一次
+_hydrate_cookies_from_env()
 
 OUT_DIR = "/tmp"
 
